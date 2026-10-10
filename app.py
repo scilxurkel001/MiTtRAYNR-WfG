@@ -8,16 +8,13 @@ import math
 import threading
 import sounddevice as sd
 
-
 # ============== Conversion between slider value and frequency ==============
 def slider_to_freq(val: float) -> float:
     return 20.0 * (1000.0 ** (val / 1000.0))
 
-
 def freq_to_slider(freq: float) -> int:
     freq = max(20.0, min(20000.0, freq))
     return int(1000.0 * math.log(freq / 20.0) / math.log(1000.0))
-
 
 # ======================= High-DPI Support =======================
 def setup_high_dpi():
@@ -29,7 +26,6 @@ def setup_high_dpi():
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
-
 
 def get_scale_factor():
     if platform.system() == 'Windows':
@@ -45,19 +41,18 @@ def get_scale_factor():
     except Exception:
         return 1.0
 
-
 # ========================= Audio Engine =========================
 class AudioEngine:
-    SCOPE_BUF_SIZE = 2048  # Oscilloscope ring buffer size
+    SCOPE_BUF_SIZE = 8192  
 
-    def __init__(self, sample_rate: int = 44100):
+    def __init__(self, sample_rate: int = 44100, blocksize: int = 1024):
         self.sample_rate = sample_rate
+        self.blocksize = blocksize
         self.phase = 0.0
         self.sweep_time = 0.0
         self.playing = False
         self.lock = threading.Lock()
         self.stream = None
-
         self.waveform = "sine"
         self.mode = "tone"
         self.frequency = 440.0
@@ -66,7 +61,7 @@ class AudioEngine:
         self.sweep_duration = 2.0
         self.log_sweep = False
         self.volume = 0.5
-
+        
         # Oscilloscope ring buffer
         self.scope_buffer = np.zeros(self.SCOPE_BUF_SIZE, dtype=np.float32)
         self.scope_lock = threading.Lock()
@@ -107,10 +102,8 @@ class AudioEngine:
             if not self.playing:
                 outdata[:] = 0
                 return
-
             dt = np.arange(frames, dtype=np.float64) / self.sample_rate
             t = dt + self.sweep_time
-
             if self.mode == "tone":
                 freqs = np.full(frames, self.frequency, dtype=np.float64)
             else:
@@ -139,12 +132,9 @@ class AudioEngine:
                 wave = np.zeros(frames)
 
             wave = wave * self.volume
-
             self._write_scope(wave.astype(np.float32))
-
             outdata[:] = wave.reshape(-1, 1)
             self.sweep_time += frames / self.sample_rate
-
             if self.mode == "sweep_once" and self.sweep_time >= self.sweep_duration:
                 self.playing = False
 
@@ -156,9 +146,14 @@ class AudioEngine:
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
+        
+        # 使用动态的 self.sample_rate 和 self.blocksize
         self.stream = sd.OutputStream(
-            samplerate=self.sample_rate, channels=1, dtype="float32",
-            callback=self._callback, blocksize=1024,
+            samplerate=self.sample_rate, 
+            channels=1, 
+            dtype="float32",
+            callback=self._callback, 
+            blocksize=self.blocksize,
         )
         self.stream.start()
 
@@ -187,7 +182,6 @@ class AudioEngine:
             buf = self.scope_buffer
             return np.concatenate([buf[pos:], buf[:pos]]).astype(np.float32)
 
-
 # ========================= GUI Application =========================
 class App:
     SCOPE_W = 700
@@ -205,7 +199,7 @@ class App:
 
     def _build_ui(self):
         p = dict(padx=10, pady=6)
-
+        
         # ---------- Waveform Selection ----------
         frm_wave = ttk.LabelFrame(self.root, text=" Waveform ")
         frm_wave.grid(row=0, column=0, sticky="nsew", **p)
@@ -247,7 +241,6 @@ class App:
         frm_sw = ttk.LabelFrame(self.root, text=" Sweep Parameters ")
         frm_sw.grid(row=2, column=0, columnspan=2, sticky="ew", **p)
         frm_sw.columnconfigure(1, weight=1)
-
         ttk.Label(frm_sw, text="Start:").grid(row=0, column=0, sticky="e", padx=4, pady=3)
         self.sw_start_sl = tk.Scale(frm_sw, from_=0, to=1000, orient="horizontal",
                                     showvalue=False, command=self._on_sw_start)
@@ -280,7 +273,6 @@ class App:
         self.sweep_widgets.append(self.sw_dur_sl)
         self.sw_dur_var = tk.StringVar(value="2.0 s")
         ttk.Label(frm_sw, textvariable=self.sw_dur_var, width=10).grid(row=2, column=2, padx=4)
-
         self.log_var = tk.BooleanVar(value=False)
         rb_lin = ttk.Radiobutton(frm_sw, text="Linear", variable=self.log_var,
                                  value=False, command=self._sync)
@@ -302,27 +294,40 @@ class App:
         self.vol_var = tk.StringVar(value="50 %")
         ttk.Label(frm_vol, textvariable=self.vol_var, width=8).grid(row=0, column=1, padx=4)
 
+        # ---------- Audio Settings ----------
+        frm_audio = ttk.LabelFrame(self.root, text=" Audio Settings ")
+        frm_audio.grid(row=4, column=0, columnspan=2, sticky="ew", **p)
+        
+        ttk.Label(frm_audio, text="Sample Rate (Hz):").grid(row=0, column=0, sticky="e", padx=4, pady=3)
+        self.sr_var = tk.StringVar(value="44100")
+        self.sr_combo = ttk.Combobox(frm_audio, textvariable=self.sr_var, width=10,
+                                     values=["22050", "44100", "48000", "96000"], state="readonly")
+        self.sr_combo.grid(row=0, column=1, padx=4, pady=3)
+
+        ttk.Label(frm_audio, text="Buffer Size (Frames):").grid(row=0, column=2, sticky="e", padx=4, pady=3)
+        self.bs_var = tk.StringVar(value="1024")
+        self.bs_combo = ttk.Combobox(frm_audio, textvariable=self.bs_var, width=10,
+                                     values=["64", "128", "256", "512", "1024", "2048", "4096"], state="readonly")
+        self.bs_combo.grid(row=0, column=3, padx=4, pady=3)
+
         # ============== Oscilloscope ==============
         frm_scope = ttk.LabelFrame(self.root, text=" Oscilloscope ")
-        frm_scope.grid(row=4, column=0, columnspan=2, sticky="nsew", **p)
+        frm_scope.grid(row=5, column=0, columnspan=2, sticky="nsew", **p)
         frm_scope.columnconfigure(0, weight=1)
-
         self.scope_canvas = tk.Canvas(frm_scope, width=self.SCOPE_W, height=self.SCOPE_H,
                                       bg="#0a0f0a", highlightthickness=1,
                                       highlightbackground="#2a3a2a")
         self.scope_canvas.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
 
-        # Controls below the scope
         frm_scope_ctrl = ttk.Frame(frm_scope)
         frm_scope_ctrl.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
         ttk.Label(frm_scope_ctrl, text="Time Scale:").pack(side="left", padx=4)
-        self.scope_cycles_var = tk.StringVar(value="64")
+        self.scope_cycles_var = tk.StringVar(value="24")
         scope_cycles_spin = ttk.Spinbox(frm_scope_ctrl, from_=1, to=10, width=4,
                                         textvariable=self.scope_cycles_var,
                                         command=self._redraw_scope_grid)
         scope_cycles_spin.pack(side="left", padx=2)
         ttk.Label(frm_scope_ctrl, text="cycles").pack(side="left", padx=2)
-
         self.scope_info_var = tk.StringVar(value="CH1  1.0V/div  |  —")
         ttk.Label(frm_scope_ctrl, textvariable=self.scope_info_var,
                   foreground="#6fbf6f").pack(side="right", padx=6)
@@ -334,7 +339,7 @@ class App:
 
         # ---------- Control ----------
         frm_ctrl = ttk.Frame(self.root)
-        frm_ctrl.grid(row=5, column=0, columnspan=2, sticky="ew", **p)
+        frm_ctrl.grid(row=6, column=0, columnspan=2, sticky="ew", **p) # 行号顺延
         self.freq_lbl = ttk.Label(frm_ctrl, text="Current Frequency: 440.0 Hz",
                                   font=("TkDefaultFont", 13, "bold"))
         self.freq_lbl.pack(side="left", padx=8)
@@ -347,7 +352,7 @@ class App:
 
         # ---------- Note ----------
         frm_info = ttk.Frame(self.root)
-        frm_info.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
+        frm_info.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6)) # 行号顺延
         ttk.Label(
             frm_info,
             text="Err... so this is a waveform generator. \n"
@@ -371,19 +376,15 @@ class App:
         c = self.scope_canvas
         c.delete("grid")
         w, h = self.SCOPE_W, self.SCOPE_H
-
         c.create_rectangle(0, 0, w, h, outline="#2a3a2a", tags="grid")
-
         for v in [-1.0, -0.5, 0.0, 0.5, 1.0]:
             y = int(h / 2 - v * (h / 2 - 4))
             color = "#3a5a3a" if v == 0 else "#1a2a1a"
             width = 1 if v == 0 else 1
             c.create_line(0, y, w, y, fill=color, width=width, tags="grid")
-
         for i in range(1, 10):
             x = int(w * i / 10)
             c.create_line(x, 0, x, h, fill="#1a2a1a", width=1, tags="grid")
-
         c.create_text(6, h / 2 - (h / 2 - 4) - 2, text="+1.0", fill="#4a7a4a",
                       anchor="w", font=("Consolas", 8), tags="grid")
         c.create_text(6, h / 2 + (h / 2 - 4) + 2, text="-1.0", fill="#4a7a4a",
@@ -396,12 +397,10 @@ class App:
         if self.engine.playing:
             data = self.engine.get_scope_data()
             self._draw_scope_wave(data)
-
-            # Update scope info label
             try:
                 cycles = int(self.scope_cycles_var.get())
             except ValueError:
-                cycles = 64
+                cycles = 24
             freq = self.engine.current_freq()
             time_per_div = (cycles / freq) / 10 if freq > 0 else 0
             if time_per_div >= 1e-3:
@@ -415,30 +414,22 @@ class App:
             pts = [0, y, self.SCOPE_W, y]
             self.scope_canvas.coords(self.scope_line, *pts)
             self.scope_info_var.set("CH1  1.0V/div  |  —")
-
-        self.root.after(16, self._update_scope)  # 60fps
+        self.root.after(16, self._update_scope)
 
     def _draw_scope_wave(self, data: np.ndarray):
         w, h = self.SCOPE_W, self.SCOPE_H
         try:
             cycles = int(self.scope_cycles_var.get())
         except ValueError:
-            cycles = 64
-
-        # Account for the current frequency to determine how many samples to display
+            cycles = 24
         freq = self.engine.current_freq() if self.engine.playing else 440.0
         freq = max(freq, 1.0)
         samples_per_cycle = self.engine.sample_rate / freq
         total_samples = int(samples_per_cycle * cycles)
         total_samples = min(total_samples, len(data))
-
         if total_samples < 2:
             return
-
-        # Get the most recent samples from the ring buffer
         recent = data[-total_samples:]
-
-        # Downsample or upsample to fit the canvas width
         if total_samples > w:
             indices = np.linspace(0, total_samples - 1, w, dtype=int)
             y_vals = recent[indices]
@@ -446,14 +437,12 @@ class App:
         else:
             x_vals = np.linspace(0, w - 1, total_samples)
             y_vals = recent
-
         y_mid = h / 2
         y_scale = h / 2 - 4
         ys = y_mid - y_vals * y_scale
         coords = np.empty(len(x_vals) * 2, dtype=np.int32)
         coords[0::2] = x_vals.astype(np.int32)
         coords[1::2] = ys.astype(np.int32)
-
         self.scope_canvas.coords(self.scope_line, *coords.tolist())
 
     # ---------- Handle Events ----------
@@ -532,18 +521,44 @@ class App:
         e.log_sweep = self.log_var.get()
         e.volume = self.vol_slider.get() / 100.0
 
+        need_restart = False
+        try:
+            new_sr = int(self.sr_var.get())
+            if new_sr != e.sample_rate:
+                e.sample_rate = new_sr
+                need_restart = True
+        except ValueError:
+            pass
+            
+        try:
+            new_bs = int(self.bs_var.get())
+            if new_bs != e.blocksize:
+                e.blocksize = new_bs
+                need_restart = True
+        except ValueError:
+            pass
+            
+        # If the engine is currently playing, restart it to apply new settings
+        if need_restart and e.playing:
+            self._start()
+
     def _start(self):
         self.engine.stop()
         self._sync()
-        self.engine.start()
-        self.status_var.set("▶ Playing")
+        try:
+            self.engine.start()
+            self.status_var.set("▶ Playing")
+        except Exception as exc:
+            # Catch exceptions related to audio device initialization and show an error message
+            messagebox.showerror("Audio Device Error", 
+                f"Failed to initialize audio stream!\n\nError message:\n{exc}")
+            self.status_var.set("⏹ Stopped")
 
     def _stop(self):
         self.engine.stop()
         self.status_var.set("⏹ Stopped")
 
     def _update_display(self):
-        """Show current frequency and update status label (called every 16ms)"""
         if self.engine.playing:
             f = self.engine.current_freq()
             self.freq_lbl.config(text=f"Current Frequency: {f:.1f} Hz")
@@ -551,12 +566,11 @@ class App:
             if "Playing" in self.status_var.get():
                 self.status_var.set("⏹ Stopped")
             self.freq_lbl.config(text="Current Frequency: —")
-        self.root.after(16, self._update_display) # 60fps
+        self.root.after(16, self._update_display)
 
     def _on_close(self):
         self.engine.stop()
         self.root.destroy()
-
 
 # ========================== Main ==========================
 if __name__ == "__main__":
