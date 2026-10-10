@@ -1,10 +1,10 @@
 # Maybe it's Time to Retaliate Against Your Noisy Roommate - Waveform Generator
 
-I’ve had enough. 
+I've had enough. 
 Every single day, my roommates are on voice chat playing *Delta Force* or other games. 
-Can’t they just go to an internet café to play?! 
+Can't they just go to an internet café to play?! 
 They play late into the night; the noise makes it impossible to sleep or even concentrate on anything. 
-Fine. If you’re going to be inconsiderate, don’t blame me if I stop being nice. 
+Fine. If you're going to be inconsiderate, don't blame me if I stop being nice. 
 
 > Disclaimer: This program is not intended to cause any personal injury; please do not use it for any illegal or improper purposes. Then again... if the roommate actually drives you to use this weapon against him, that roommate is hardly human.
 
