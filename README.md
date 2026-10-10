@@ -39,8 +39,8 @@ Or execute the command `.venv\Scripts\activate` (Windows) or `source .venv/bin/a
 
 ## Production Packaging
 
-Execute `uv run pyinstaller -F --noconsole --add-data "assets;assets" --name "MiTtRAYNR-WfG" app.py`. 
-Or execute the command `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (macOS / Linux) to activate the environment, and execute `pyinstaller -F --noconsole --add-data "assets;assets" --name "MiTtRAYNR-WfG" app.py`.
+Execute `uv run pyinstaller -F --noconsole --name "MiTtRAYNR-WfG" app.py`. 
+Or execute the command `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (macOS / Linux) to activate the environment, and execute `pyinstaller -F --noconsole --name "MiTtRAYNR-WfG" app.py`.
 
 ## Note
 
