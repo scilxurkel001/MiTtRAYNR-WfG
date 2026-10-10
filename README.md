@@ -10,7 +10,7 @@ Fine. If you're going to be inconsiderate, don't blame me if I stop being nice.
 
 ## Features
 
-It’s just a waveform generator with all the standard functions—that’s it, nothing special.
+It's just a waveform generator with all the standard functions—that's it, nothing special.
 
 ## Building and Installation
 
