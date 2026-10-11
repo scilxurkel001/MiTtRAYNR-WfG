@@ -37,3 +37,7 @@ In any case, these attacks make it impossible for the victim to continue playing
 When conducting attacks, please be sure to protect your hearing—especially during high-frequency or ultra-high-frequency operations. It is recommended to wear closed-back monitoring headphones (such as the Sennheiser HD 280 Pro) that are not connected to any audio source, or to use 3M industrial-grade earmuffs.
 
 Additionally, it is best to use the recommended equipment; standard audio gear is highly susceptible to high-frequency diaphragm rupture or circuit failure (short circuits or open circuits) caused by inadequate heat dissipation when used for high- or ultra-high-frequency attacks.
+
+### Disclaimer
+
+These parameters are intended solely for non-human experiments and should not be applied to attacks against actual human beings; the author assumes no liability for any attacks resulting in personal injury.
