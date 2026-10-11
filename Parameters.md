@@ -28,7 +28,7 @@ It is essentially useless. ANC (Active Noise Cancellation) works by having the h
 
 Furthermore, low-frequency attacks induce low-frequency resonance, causing the air in the room—and even human organs and viscera—to vibrate, leading to symptoms like chest tightness, dizziness, and anxiety.
 
-High-frequency attacks—using piercing sweeps or sawtooth waves—directly stimulate the amygdala, forcibly triggering the "fight-or-flight" anxiety response. Moreover, microphones pick up these high-frequency signals, causing teammates to experience the same reaction; they will likely curse the attacker's family and kick them out of the voice channel.
+High-frequency attacks—using piercing sweeps or sawtooth waves—directly stimulate the amygdala, forcibly triggering the "fight-or-flight" anxiety response. Moreover, microphones pick up these high-frequency signals, causing teammates to experience the same reaction; they will likely curse the victim's family and kick them out of the voice channel.
 
 In any case, these attacks make it impossible for the victim to continue playing the game, forcing them to ask you to turn off this "weapon." That is the moment you can bring up the issue of their noise—a classic case of "Mutually Assured Destruction."
 
