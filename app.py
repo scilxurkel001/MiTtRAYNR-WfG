@@ -53,7 +53,7 @@ class AudioEngine:
         self.playing = False
         self.lock = threading.Lock()
         self.stream = None
-        self.waveform = "sine"
+        self.waveforms = ["sine"]
         self.mode = "tone"
         self.frequency = 440.0
         self.sweep_start = 200.0
@@ -61,6 +61,13 @@ class AudioEngine:
         self.sweep_duration = 2.0
         self.log_sweep = False
         self.volume = 0.5
+
+        # Random frequency hopping
+        self.hop_start = 200.0
+        self.hop_end = 2000.0
+        self.hop_interval = 1.0          # seconds between hops (min 0.1 s)
+        self.hop_freq = 440.0            # currently active hop frequency
+        self.hop_next_time = 0.0         # engine time for the next hop
         
         # Oscilloscope ring buffer
         self.scope_buffer = np.zeros(self.SCOPE_BUF_SIZE, dtype=np.float32)
@@ -78,6 +85,30 @@ class AudioEngine:
         if self.log_sweep:
             return self.sweep_start * (self.sweep_end / self.sweep_start) ** progress
         return self.sweep_start + (self.sweep_end - self.sweep_start) * progress
+
+    @staticmethod
+    def _wave_shape(name: str, phases: np.ndarray) -> np.ndarray:
+        if name == "sine":
+            return np.sin(phases)
+        if name == "square":
+            return np.sign(np.sin(phases))
+        if name == "triangle":
+            p = phases % (2.0 * np.pi)
+            return np.where(p < np.pi, -1.0 + 2.0 * p / np.pi, 3.0 - 2.0 * p / np.pi)
+        if name == "sawtooth":
+            p = phases % (2.0 * np.pi)
+            return -1.0 + p / np.pi
+        return np.zeros(len(phases))
+
+    def _new_hop(self, now: float):
+        lo, hi = self.hop_start, self.hop_end
+        if lo > hi:
+            lo, hi = hi, lo
+        lo = max(20.0, lo)
+        hi = max(20.0, hi)
+        self.hop_freq = float(np.random.uniform(lo, hi)) if hi > lo else lo
+        interval = max(0.1, self.hop_interval)
+        self.hop_next_time = now + interval
 
     def _write_scope(self, wave: np.ndarray):
         n = len(wave)
@@ -106,6 +137,12 @@ class AudioEngine:
             t = dt + self.sweep_time
             if self.mode == "tone":
                 freqs = np.full(frames, self.frequency, dtype=np.float64)
+            elif self.mode == "random_hop":
+                # Hold the current hop frequency across this block, then choose
+                # a new random frequency once the interval has elapsed.
+                freqs = np.full(frames, self.hop_freq, dtype=np.float64)
+                if t[-1] >= self.hop_next_time:
+                    self._new_hop(t[-1])
             else:
                 if self.mode == "sweep_repeat":
                     t_mod = t % self.sweep_duration
@@ -117,19 +154,15 @@ class AudioEngine:
             phases = self.phase + 2.0 * np.pi * np.cumsum(freqs) / self.sample_rate
             self.phase = phases[-1] % (2.0 * np.pi)
 
-            # Generate waveform
-            if self.waveform == "sine":
-                wave = np.sin(phases)
-            elif self.waveform == "square":
-                wave = np.sign(np.sin(phases))
-            elif self.waveform == "triangle":
-                p = phases % (2.0 * np.pi)
-                wave = np.where(p < np.pi, -1.0 + 2.0 * p / np.pi, 3.0 - 2.0 * p / np.pi)
-            elif self.waveform == "sawtooth":
-                p = phases % (2.0 * np.pi)
-                wave = -1.0 + p / np.pi
+            # Generate and combine all selected waveforms
+            names = self.waveforms or ["sine"]
+            if len(names) == 1:
+                wave = self._wave_shape(names[0], phases)
             else:
-                wave = np.zeros(frames)
+                wave = np.zeros(frames, dtype=np.float64)
+                for name in names:
+                    wave += self._wave_shape(name, phases)
+                wave /= len(names)
 
             wave = wave * self.volume
             self._write_scope(wave.astype(np.float32))
@@ -143,6 +176,8 @@ class AudioEngine:
             self.phase = 0.0
             self.sweep_time = 0.0
             self.playing = True
+            if self.mode == "random_hop":
+                self._new_hop(0.0)
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
@@ -169,6 +204,8 @@ class AudioEngine:
         with self.lock:
             if self.mode == "tone":
                 return self.frequency
+            if self.mode == "random_hop":
+                return self.hop_freq
             t = self.sweep_time
             if self.mode == "sweep_repeat":
                 t %= self.sweep_duration
@@ -200,13 +237,16 @@ class App:
     def _build_ui(self):
         p = dict(padx=10, pady=6)
         
-        # ---------- Waveform Selection ----------
-        frm_wave = ttk.LabelFrame(self.root, text=" Waveform ")
+        # ---------- Waveform Selection (multi-select, 1-4) ----------
+        frm_wave = ttk.LabelFrame(self.root, text=" Waveform (select 1-4) ")
         frm_wave.grid(row=0, column=0, sticky="nsew", **p)
-        self.wave_var = tk.StringVar(value="sine")
+        self.wave_vars: dict = {}
+        self._last_wave = "sine"
         for i, name in enumerate(["sine", "square", "triangle", "sawtooth"]):
-            ttk.Radiobutton(frm_wave, text=name.capitalize(), variable=self.wave_var,
-                            value=name, command=self._sync).grid(row=i, column=0, sticky="w", padx=10, pady=2)
+            var = tk.BooleanVar(value=(name == "sine"))
+            self.wave_vars[name] = var
+            ttk.Checkbutton(frm_wave, text=name.capitalize(), variable=var,
+                            command=self._on_wave_change).grid(row=i, column=0, sticky="w", padx=10, pady=2)
 
         # ---------- Mode Selection ----------
         frm_mode = ttk.LabelFrame(self.root, text=" Mode ")
@@ -214,10 +254,12 @@ class App:
         self.mode_var = tk.StringVar(value="tone")
         self.tone_widgets: list = []
         self.sweep_widgets: list = []
+        self.hop_widgets: list = []
         for i, (label, val) in enumerate([
             ("Continuous Tone", "tone"),
             ("Single Sweep", "sweep_once"),
-            ("Repeated Sweep", "sweep_repeat")
+            ("Repeated Sweep", "sweep_repeat"),
+            ("Random Frequency Hop", "random_hop")
         ]):
             ttk.Radiobutton(frm_mode, text=label, variable=self.mode_var,
                             value=val, command=self._on_mode_change).grid(row=i, column=0, sticky="w", padx=10, pady=2)
@@ -283,9 +325,49 @@ class App:
         rb_log.grid(row=3, column=2, sticky="w", padx=4, pady=2)
         self.sweep_widgets.append(rb_log)
 
+        # ---------- Random Hop Parameters ----------
+        frm_hop = ttk.LabelFrame(self.root, text=" Random Hop Parameters ")
+        frm_hop.grid(row=3, column=0, columnspan=2, sticky="ew", **p)
+        frm_hop.columnconfigure(1, weight=1)
+        ttk.Label(frm_hop, text="Min:").grid(row=0, column=0, sticky="e", padx=4, pady=3)
+        self.hop_min_sl = tk.Scale(frm_hop, from_=0, to=1000, orient="horizontal",
+                                   showvalue=False, command=self._on_hop_min)
+        self.hop_min_sl.set(freq_to_slider(200))
+        self.hop_min_sl.grid(row=0, column=1, sticky="ew", padx=4)
+        self.hop_widgets.append(self.hop_min_sl)
+        self.hop_min_var = tk.StringVar(value="200.0 Hz")
+        h1 = ttk.Entry(frm_hop, textvariable=self.hop_min_var, width=12)
+        h1.grid(row=0, column=2, padx=4)
+        h1.bind("<Return>", self._on_hop_min_entry)
+        self.hop_widgets.append(h1)
+
+        ttk.Label(frm_hop, text="Max:").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        self.hop_max_sl = tk.Scale(frm_hop, from_=0, to=1000, orient="horizontal",
+                                   showvalue=False, command=self._on_hop_max)
+        self.hop_max_sl.set(freq_to_slider(2000))
+        self.hop_max_sl.grid(row=1, column=1, sticky="ew", padx=4)
+        self.hop_widgets.append(self.hop_max_sl)
+        self.hop_max_var = tk.StringVar(value="2000.0 Hz")
+        h2 = ttk.Entry(frm_hop, textvariable=self.hop_max_var, width=12)
+        h2.grid(row=1, column=2, padx=4)
+        h2.bind("<Return>", self._on_hop_max_entry)
+        self.hop_widgets.append(h2)
+
+        ttk.Label(frm_hop, text="Interval:").grid(row=2, column=0, sticky="e", padx=4, pady=3)
+        self.hop_int_sl = tk.Scale(frm_hop, from_=100, to=10000, orient="horizontal",
+                                   showvalue=False, command=self._on_hop_int)
+        self.hop_int_sl.set(1000)
+        self.hop_int_sl.grid(row=2, column=1, sticky="ew", padx=4)
+        self.hop_widgets.append(self.hop_int_sl)
+        self.hop_int_var = tk.StringVar(value="1000 ms")
+        h3 = ttk.Entry(frm_hop, textvariable=self.hop_int_var, width=12)
+        h3.grid(row=2, column=2, padx=4)
+        h3.bind("<Return>", self._on_hop_int_entry)
+        self.hop_widgets.append(h3)
+
         # ---------- Volume ----------
         frm_vol = ttk.LabelFrame(self.root, text=" Volume ")
-        frm_vol.grid(row=3, column=0, columnspan=2, sticky="ew", **p)
+        frm_vol.grid(row=4, column=0, columnspan=2, sticky="ew", **p)
         frm_vol.columnconfigure(0, weight=1)
         self.vol_slider = tk.Scale(frm_vol, from_=0, to=100, orient="horizontal",
                                    showvalue=False, command=self._on_vol)
@@ -296,7 +378,7 @@ class App:
 
         # ---------- Audio Settings ----------
         frm_audio = ttk.LabelFrame(self.root, text=" Audio Settings ")
-        frm_audio.grid(row=4, column=0, columnspan=2, sticky="ew", **p)
+        frm_audio.grid(row=5, column=0, columnspan=2, sticky="ew", **p)
         
         ttk.Label(frm_audio, text="Sample Rate (Hz):").grid(row=0, column=0, sticky="e", padx=4, pady=3)
         self.sr_var = tk.StringVar(value="44100")
@@ -312,7 +394,7 @@ class App:
 
         # ============== Oscilloscope ==============
         frm_scope = ttk.LabelFrame(self.root, text=" Oscilloscope ")
-        frm_scope.grid(row=5, column=0, columnspan=2, sticky="nsew", **p)
+        frm_scope.grid(row=6, column=0, columnspan=2, sticky="nsew", **p)
         frm_scope.columnconfigure(0, weight=1)
         self.scope_canvas = tk.Canvas(frm_scope, width=self.SCOPE_W, height=self.SCOPE_H,
                                       bg="#0a0f0a", highlightthickness=1,
@@ -339,7 +421,7 @@ class App:
 
         # ---------- Control ----------
         frm_ctrl = ttk.Frame(self.root)
-        frm_ctrl.grid(row=6, column=0, columnspan=2, sticky="ew", **p) # 行号顺延
+        frm_ctrl.grid(row=7, column=0, columnspan=2, sticky="ew", **p) 
         self.freq_lbl = ttk.Label(frm_ctrl, text="Current Frequency: 440.0 Hz",
                                   font=("TkDefaultFont", 13, "bold"))
         self.freq_lbl.pack(side="left", padx=8)
@@ -352,7 +434,7 @@ class App:
 
         # ---------- Note ----------
         frm_info = ttk.Frame(self.root)
-        frm_info.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6)) # 行号顺延
+        frm_info.grid(row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
         ttk.Label(
             frm_info,
             text="Err... so this is a waveform generator. \n"
@@ -496,29 +578,95 @@ class App:
         self.sw_dur_var.set(f"{d:.1f} s")
         self._sync()
 
+    def _on_hop_min(self, val):
+        f = slider_to_freq(float(val))
+        self.hop_min_var.set(f"{f:.1f} Hz")
+        self._sync()
+
+    def _on_hop_min_entry(self, _=None):
+        try:
+            f = float(self.hop_min_var.get().replace("Hz", "").strip())
+            f = max(20.0, min(20000.0, f))
+            self.hop_min_sl.set(freq_to_slider(f))
+            self.hop_min_var.set(f"{f:.1f} Hz")
+            self._sync()
+        except ValueError:
+            pass
+
+    def _on_hop_max(self, val):
+        f = slider_to_freq(float(val))
+        self.hop_max_var.set(f"{f:.1f} Hz")
+        self._sync()
+
+    def _on_hop_max_entry(self, _=None):
+        try:
+            f = float(self.hop_max_var.get().replace("Hz", "").strip())
+            f = max(20.0, min(20000.0, f))
+            self.hop_max_sl.set(freq_to_slider(f))
+            self.hop_max_var.set(f"{f:.1f} Hz")
+            self._sync()
+        except ValueError:
+            pass
+
+    def _on_hop_int(self, val):
+        self.hop_int_var.set(f"{int(float(val))} ms")
+        self._sync()
+
+    def _on_hop_int_entry(self, _=None):
+        try:
+            ms = float(self.hop_int_var.get().replace("ms", "").strip())
+            ms = max(100.0, min(10000.0, ms))
+            self.hop_int_sl.set(int(ms))
+            self.hop_int_var.set(f"{int(ms)} ms")
+            self._sync()
+        except ValueError:
+            pass
+
+    def _on_wave_change(self):
+        # Enforce at least one and at most four selected waveforms
+        selected = [n for n, v in self.wave_vars.items() if v.get()]
+        if len(selected) == 0:
+            messagebox.showwarning("Waveform Selection",
+                                   "Please select at least one waveform.")
+            # Restore the waveform that was just deselected
+            self.wave_vars[self._last_wave].set(True)
+        elif len(selected) > 4:
+            messagebox.showwarning("Waveform Selection",
+                                   "You can select at most four waveforms.")
+            self.wave_vars[self._last_wave].set(False)
+        else:
+            self._last_wave = selected[-1]
+        self._sync()
+
     def _on_vol(self, val):
         self.vol_var.set(f"{val} %")
         self._sync()
 
     def _on_mode_change(self):
-        is_tone = self.mode_var.get() == "tone"
-        st_tone = "normal" if is_tone else "disabled"
-        st_sw = "disabled" if is_tone else "normal"
+        mode = self.mode_var.get()
+        is_tone = mode == "tone"
+        is_sweep = mode in ("sweep_once", "sweep_repeat")
+        is_hop = mode == "random_hop"
         for w in self.tone_widgets:
-            w.config(state=st_tone)
+            w.config(state="normal" if is_tone else "disabled")
         for w in self.sweep_widgets:
-            w.config(state=st_sw)
+            w.config(state="normal" if is_sweep else "disabled")
+        for w in self.hop_widgets:
+            w.config(state="normal" if is_hop else "disabled")
         self._sync()
 
     def _sync(self):
         e = self.engine
-        e.waveform = self.wave_var.get()
+        e.waveforms = [n for n, v in self.wave_vars.items() if v.get()] or ["sine"]
         e.mode = self.mode_var.get()
         e.frequency = slider_to_freq(self.tone_slider.get())
         e.sweep_start = slider_to_freq(self.sw_start_sl.get())
         e.sweep_end = slider_to_freq(self.sw_end_sl.get())
         e.sweep_duration = self.sw_dur_sl.get() / 10.0
         e.log_sweep = self.log_var.get()
+        e.hop_start = slider_to_freq(self.hop_min_sl.get())
+        e.hop_end = slider_to_freq(self.hop_max_sl.get())
+        e.hop_interval = max(0.1, self.hop_int_sl.get() / 1000.0)
         e.volume = self.vol_slider.get() / 100.0
 
         need_restart = False
