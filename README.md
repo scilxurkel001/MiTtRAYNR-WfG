@@ -1,6 +1,6 @@
 # Maybe it's Time to Retaliate Against Your Noisy Roommate - Waveform Generator
 
-English (This Document) | (简体中文 Simplified Chinese)[README_ZHCN.md]
+English (This Document) | [简体中文 Simplified Chinese](README_ZHCN.md)
 
 I’ve had enough. 
 Every single day, my roommates are on voice chat playing *Delta Force* or other games. 
