@@ -1,6 +1,6 @@
 # 也许是时候反击你那吵闹的室友了 - 波形发生器
 
-(English)[README.md] | 简体中文 Simplified Chinese（本文档）
+[English](README.md) | 简体中文 Simplified Chinese（本文档）
 
 我受够了。
 每一天，我的室友都在语音通话里玩《三角洲行动》或其他游戏。
