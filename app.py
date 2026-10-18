@@ -273,9 +273,11 @@ class App:
     SCOPE_W = 700
     SCOPE_H = 220
     OSC_SPLIT_X = 412          # right edge of the oscilloscope (waveform) panel
-    FFT_BARS = 96              # number of spectrum bars in the FFT panel
-    FFT_DB_MIN = -80.0         # bottom of the FFT amplitude scale (dB)
-    FFT_DB_MAX = 0.0           # top of the FFT amplitude scale (dB)
+    FFT_DB_MIN = -80.0         # spectrogram floor (dBFS)
+    FFT_DB_MAX = 0.0           # spectrogram ceiling (dBFS)
+    FFT_MIN_HZ = 20.0          # lowest displayed frequency
+    FFT_MAX_HZ = 18000.0       # highest displayed frequency (clipped to Nyquist)
+    FFT_FPS = 30               # spectrogram refresh rate (frames per second)
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -283,6 +285,18 @@ class App:
         self.root.resizable(False, False)
         self.engine = AudioEngine()
         self.track_error = None
+        # Spectrogram state (populated by _create_spectrogram).
+        self.spec_photo = None
+        self.spec_item = None
+        self.spec_lut = self._build_spec_lut()
+        self.spec_fw = 0           # panel width in pixels (= image width)
+        self.spec_h = 0            # image height (= rows per column)
+        self._spec_edges = None
+        self._spec_edges_key = None
+        # Feed the spectrogram at FFT_FPS while the scope refreshes at ~60 fps.
+        self._spec_every = max(1, int(round((1000.0 / self.FFT_FPS) / 16.0)))
+        self._spec_counter = 0
+        self._spec_was_active = False
         self._load_demo_track()
         self._build_ui()
         self._update_display()
@@ -496,7 +510,7 @@ class App:
         self.scope_line = self.scope_canvas.create_line(
             [0] * (self.SCOPE_W * 2), fill="#39ff6e", width=1.6, smooth=False
         )
-        self._create_fft_bars()
+        self._create_spectrogram()
 
         # ---------- Control ----------
         frm_ctrl = ttk.Frame(self.root)
@@ -552,20 +566,150 @@ class App:
 
     def _on_scope_resize(self, _event=None):
         self._draw_scope_grid()
+        w, h, split = self._scope_geometry()
+        if (self.spec_photo is None
+                or self.spec_fw != max(1, w - split)
+                or self.spec_h != max(1, h)):
+            self._create_spectrogram()
+        else:
+            self._draw_spectrogram_axis()
 
-    # ---------- Create FFT Bar Rectangles ----------
-    def _create_fft_bars(self):
-        """Pre-create the spectrum bar rectangles so per-frame updates are cheap.
+    # ---------- Spectrogram ----------
+    @staticmethod
+    def _build_spec_lut():
+        """Build a 256-entry inferno-like colormap as Tk color strings."""
+        stops = [
+            (0.00, (0, 0, 4)),
+            (0.15, (40, 11, 84)),
+            (0.35, (101, 21, 110)),
+            (0.55, (159, 42, 99)),
+            (0.72, (212, 72, 66)),
+            (0.86, (245, 125, 21)),
+            (1.00, (252, 255, 164)),
+        ]
+        lut = []
+        for i in range(256):
+            t = i / 255.0
+            for j in range(len(stops) - 1):
+                t0, c0 = stops[j]
+                t1, c1 = stops[j + 1]
+                if t <= t1 or j == len(stops) - 2:
+                    u = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                    u = min(1.0, max(0.0, u))
+                    lut.append("#{:02x}{:02x}{:02x}".format(
+                        int(round(c0[0] + (c1[0] - c0[0]) * u)),
+                        int(round(c0[1] + (c1[1] - c0[1]) * u)),
+                        int(round(c0[2] + (c1[2] - c0[2]) * u)),
+                    ))
+                    break
+        return lut
 
-        Only the item ids are created here; positions are computed each frame
-        from the canvas's live geometry (see ``_draw_spectrum``).
+    def _create_spectrogram(self):
+        """Create a panel-width image that scrolls one column per frame.
+
+        Tk's ``photo copy`` shifts pixels in C, so the image can be nudged one
+        pixel to the left every frame with no Python-side history buffer and no
+        periodic full repaint. Because the image is exactly as wide as the
+        panel, it can never spill over the oscilloscope and its left edge is a
+        clean boundary.
         """
-        self.fft_bars = []
-        for _ in range(self.FFT_BARS):
-            rid = self.scope_canvas.create_rectangle(
-                0, 0, 0, 0, fill="#39ff6e", outline=""
-            )
-            self.fft_bars.append(rid)
+        w, h, split = self._scope_geometry()
+        self.spec_fw = max(1, w - split)
+        self.spec_h = max(1, h)
+        self.spec_black = "#050807"
+        if self.spec_item is not None:
+            self.scope_canvas.delete(self.spec_item)
+        self.spec_photo = tk.PhotoImage(width=self.spec_fw, height=self.spec_h)
+        self.spec_photo.put(self.spec_black,
+                            to=(0, 0, self.spec_fw, self.spec_h))
+        self.spec_item = self.scope_canvas.create_image(
+            split, 0, anchor="nw", image=self.spec_photo
+        )
+        self._draw_spectrogram_axis()
+
+    def _draw_spectrogram_axis(self):
+        """Draw the frequency scale over the spectrogram image."""
+        c = self.scope_canvas
+        c.delete("axis")
+        w, h, split = self._scope_geometry()
+        c.create_rectangle(split, 0, w, h, outline="#2a3a2a", tags="axis")
+        f_lo = self.FFT_MIN_HZ
+        f_hi = min(self.FFT_MAX_HZ, self.engine.sample_rate / 2.0)
+        if f_hi > f_lo:
+            for f in (1000, 5000, 10000, 15000, 20000):
+                if f < f_lo or f > f_hi:
+                    continue
+                frac = (f - f_lo) / (f_hi - f_lo)
+                y = int(h - 1 - frac * (h - 2))
+                c.create_line(split, y, w, y, fill="#3a2a18", width=1, tags="axis")
+                c.create_text(split + 3, y - 1, text=f"{f // 1000}kHz",
+                              fill="#c8924a", anchor="sw",
+                              font=("Consolas", 7), tags="axis")
+        c.create_text(split + 4, 2, text="Spectrogram", fill="#c8924a",
+                      anchor="nw", font=("Consolas", 8), tags="axis")
+        c.tag_raise("axis")
+        c.tag_lower("grid")
+
+    def _spec_freq_edges(self, n):
+        """Return FFT bin indices delimiting each spectrogram row (bottom-up)."""
+        key = (n, self.engine.sample_rate, self.spec_h)
+        if self._spec_edges is not None and self._spec_edges_key == key:
+            return self._spec_edges
+        f_lo = self.FFT_MIN_HZ
+        f_hi = min(self.FFT_MAX_HZ, self.engine.sample_rate / 2.0)
+        if f_hi <= f_lo:
+            return None
+        freqs = np.fft.rfftfreq(n, d=1.0 / self.engine.sample_rate)
+        edges = np.linspace(f_lo, f_hi, self.spec_h + 1)
+        self._spec_edges = np.searchsorted(freqs, edges)
+        self._spec_edges_key = key
+        return self._spec_edges
+
+    def _feed_spectrogram(self, data: np.ndarray):
+        """Scroll the image one pixel left and write the new column on the right."""
+        if self.spec_photo is None or data is None or len(data) < 16:
+            return
+        n = len(data)
+        h = self.spec_h
+        seg = data - float(np.mean(data))
+        spectrum = np.abs(np.fft.rfft(seg * np.hanning(n)))
+        peak = float(np.max(spectrum))
+        if peak > 1e-12:
+            spectrum = spectrum / peak
+        db = 20.0 * np.log10(spectrum + 1e-12)
+        norm = (db - self.FFT_DB_MIN) / (self.FFT_DB_MAX - self.FFT_DB_MIN)
+        idx = np.clip(norm * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+
+        edges = self._spec_freq_edges(n)
+        if edges is None:
+            return
+        # Each row is the brightest FFT bin falling within its frequency band,
+        # built bottom-up; reverse it so high frequencies sit at the top of the
+        # image (matching the on-screen frequency axis).
+        col = np.empty(h, dtype=np.uint8)
+        lum = len(idx) - 1
+        for y in range(h):
+            s = int(edges[y])
+            e = int(edges[y + 1])
+            if e > s:
+                col[y] = int(idx[s:e].max())
+            else:
+                col[y] = int(idx[min(s, lum)])
+
+        img = self.spec_photo
+        fw = self.spec_fw
+        # Shift the whole image one pixel left using Tk's C-level pixel copy.
+        img.tk.call(img.name, "copy", img.name,
+                    "-from", 1, 0, fw, h, "-to", 0, 0)
+        # Overwrite the (now stale) rightmost column with the new spectrum.
+        img.put(" ".join(self.spec_lut[b] for b in col[::-1]),
+                to=(fw - 1, 0))
+
+    def _clear_spectrogram(self):
+        if self.spec_photo is None:
+            return
+        self.spec_photo.put(self.spec_black,
+                            to=(0, 0, self.spec_fw, self.spec_h))
 
     # ---------- Paint Oscilloscope Grid ----------
     def _draw_scope_grid(self):
@@ -587,22 +731,8 @@ class App:
         c.create_text(6, h / 2 + (h / 2 - 4) + 2, text="-1.0", fill="#4a7a4a",
                       anchor="w", font=("Consolas", 8), tags="grid")
 
-        # --- FFT panel (right): dB amplitude grid ---
-        c.create_rectangle(split, 0, w, h, outline="#2a3a2a", tags="grid")
-        span = self.FFT_DB_MAX - self.FFT_DB_MIN
-        for db in (-60, -40, -20, 0):
-            frac = (db - self.FFT_DB_MIN) / span
-            y = int(h - 4 - frac * (h - 8))
-            c.create_line(split, y, w, y, fill="#1a2a1a", width=1, tags="grid")
-            c.create_text(split + 3, y - 1, text=f"{db}", fill="#4a7a4a",
-                          anchor="sw", font=("Consolas", 7), tags="grid")
-        for i in range(1, 5):
-            x = int(split + (w - split) * i / 5)
-            c.create_line(x, 0, x, h, fill="#1a2a1a", width=1, tags="grid")
-        c.create_line(split, 0, split, h, fill="#3a5a3a", width=1, tags="grid")
-        c.create_text(split + 4, 3, text="FFT  (dB)", fill="#4a7a4a",
-                      anchor="nw", font=("Consolas", 8), tags="grid")
-        # Keep the grid behind the trace and spectrum bars.
+        # --- Spectrogram panel (right) is drawn separately in _draw_spectrogram_axis ---
+        # Keep the grid behind the waveform trace and the spectrogram image.
         c.tag_lower("grid")
 
     def _redraw_scope_grid(self):
@@ -610,9 +740,13 @@ class App:
 
     def _update_scope(self):
         if self.engine.playing:
+            self._spec_was_active = True
             data = self.engine.get_scope_data()
             self._draw_scope_wave(data)
-            self._draw_spectrum(data)
+            self._spec_counter += 1
+            if self._spec_counter >= self._spec_every:
+                self._spec_counter = 0
+                self._feed_spectrogram(data)
             if self.engine.mode == "track":
                 self.scope_info_var.set("CH1  1.0V/div  |  Demo Track")
             else:
@@ -632,76 +766,11 @@ class App:
             y = h // 2
             pts = [0, y, split, y]
             self.scope_canvas.coords(self.scope_line, *pts)
-            self._clear_spectrum()
+            if self._spec_was_active:
+                self._spec_was_active = False
+                self._clear_spectrogram()
             self.scope_info_var.set("CH1  1.0V/div  |  —")
         self.root.after(16, self._update_scope)
-
-    def _draw_spectrum(self, data: np.ndarray):
-        """Compute an FFT of the most recent samples and update the bar graph."""
-        if data is None or len(data) < 16:
-            self._clear_spectrum()
-            return
-        n = len(data)
-        # Remove DC offset so a constant bias doesn't dominate the spectrum.
-        seg = data - float(np.mean(data))
-        # Hanning window reduces spectral leakage between bins.
-        window = np.hanning(n)
-        spectrum = np.abs(np.fft.rfft(seg * window))
-        if not np.any(spectrum):
-            self._clear_spectrum()
-            return
-        # Normalise so the strongest component sits near the top of the scale.
-        spectrum /= (np.max(spectrum) + 1e-12)
-        db = 20.0 * np.log10(spectrum + 1e-12)
-
-        # Only show the audible band (approx. 20 Hz to 18 kHz, clipped by Nyquist).
-        freqs = np.fft.rfftfreq(n, d=1.0 / self.engine.sample_rate)
-        nyquist = self.engine.sample_rate / 2.0
-        f_hi = min(18000.0, nyquist)
-        lo_bin = int(np.searchsorted(freqs, 20.0))
-        hi_bin = int(np.searchsorted(freqs, f_hi))
-
-        n_bars = self.FFT_BARS
-        w, h, split = self._scope_geometry()
-        x0, x1 = split, w
-        top = 4
-        bottom = h - 4
-        span = self.FFT_DB_MAX - self.FFT_DB_MIN
-        usable = (x1 - x0) - 4
-        bar_w = usable / n_bars
-
-        # Logarithmically spaced bin edges so low frequencies get more detail.
-        if hi_bin <= lo_bin or bar_w <= 0:
-            self._clear_spectrum()
-            return
-        edges = np.unique(np.geomspace(
-            max(lo_bin, 1), hi_bin, num=n_bars + 1
-        ).astype(int))
-        # If the band collapses to fewer bars than we draw, pad the edges.
-        if len(edges) < 2:
-            self._clear_spectrum()
-            return
-
-        for i, rid in enumerate(self.fft_bars):
-            bx0 = x0 + 2 + i * bar_w + 0.5
-            bx1 = bx0 + bar_w - 1.0
-            frac = i / n_bars
-            start = edges[min(int(frac * (len(edges) - 1)), len(edges) - 2)]
-            end = edges[min(int((i + 1) / n_bars * (len(edges) - 1)), len(edges) - 1)]
-            if end <= start:
-                peak_db = db[start] if start < len(db) else self.FFT_DB_MIN
-            else:
-                peak_db = float(np.max(db[start:end]))
-            level = (peak_db - self.FFT_DB_MIN) / span
-            level = min(1.0, max(0.0, level))
-            y_top = bottom - level * (bottom - top)
-            self.scope_canvas.coords(rid, bx0, y_top, bx1, bottom)
-
-    def _clear_spectrum(self):
-        _w, h, _split = self._scope_geometry()
-        bottom = h - 4
-        for rid in self.fft_bars:
-            self.scope_canvas.coords(rid, 0, bottom, 0, bottom)
 
     def _draw_scope_wave(self, data: np.ndarray):
         _w, h, split = self._scope_geometry()
