@@ -3,9 +3,13 @@
 altgraph==0.17.5
     # via pyinstaller
 cffi==2.1.1
-    # via sounddevice
+    # via
+    #   sounddevice
+    #   soundfile
 numpy==2.5.3
-    # via mittraynr-wfg (pyproject.toml)
+    # via
+    #   mittraynr-wfg (pyproject.toml)
+    #   soundfile
 packaging==26.3
     # via
     #   pyinstaller
@@ -24,3 +28,7 @@ setuptools==84.0.0
     # via pyinstaller
 sounddevice==0.5.6
     # via mittraynr-wfg (pyproject.toml)
+soundfile==0.14.0
+    # via mittraynr-wfg (pyproject.toml)
+typing-extensions==4.16.0
+    # via soundfile
