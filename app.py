@@ -1,4 +1,5 @@
 import os
+import sys
 import platform
 import ctypes
 import tkinter as tk
@@ -7,6 +8,13 @@ import numpy as np
 import math
 import threading
 import sounddevice as sd
+import soundfile as sf
+
+
+def resource_path(rel_path: str) -> str:
+    """Resolve a bundled resource path for both source runs and PyInstaller."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel_path)
 
 # ============== Conversion between slider value and frequency ==============
 def slider_to_freq(val: float) -> float:
@@ -74,6 +82,25 @@ class AudioEngine:
         self.scope_lock = threading.Lock()
         self.scope_write_pos = 0
 
+        # Audio track playback (e.g. the bundled demo track)
+        self.track_data = None          # mono float32 samples
+        self.track_pos = 0              # playback cursor (samples)
+        self.track_name = ""
+        self.track_samplerate = 0       # native sample rate of the track
+
+    def load_track(self, path: str, name: str = "") -> None:
+        """Decode an audio file into a mono float32 buffer for playback."""
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        if data.shape[1] > 1:
+            data = data.mean(axis=1)
+        else:
+            data = data[:, 0]
+        with self.lock:
+            self.track_data = np.ascontiguousarray(data, dtype=np.float32)
+            self.track_name = name or os.path.basename(path)
+            self.track_samplerate = int(sr)
+            self.track_pos = 0
+
     def _freq_at(self, t: float) -> float:
         progress = t / self.sweep_duration
         if self.log_sweep:
@@ -133,6 +160,25 @@ class AudioEngine:
             if not self.playing:
                 outdata[:] = 0
                 return
+            if self.mode == "track":
+                # Loop the decoded audio track continuously.
+                if self.track_data is None or len(self.track_data) == 0:
+                    outdata[:] = 0
+                    return
+                n = len(self.track_data)
+                pos = self.track_pos
+                if pos + frames <= n:
+                    chunk = self.track_data[pos:pos + frames]
+                else:
+                    first = n - pos
+                    chunk = np.concatenate(
+                        [self.track_data[pos:], self.track_data[:frames - first]]
+                    )
+                self.track_pos = (pos + frames) % n
+                wave = chunk * self.volume
+                self._write_scope(wave.astype(np.float32))
+                outdata[:] = wave.reshape(-1, 1)
+                return
             dt = np.arange(frames, dtype=np.float64) / self.sample_rate
             t = dt + self.sweep_time
             if self.mode == "tone":
@@ -175,6 +221,7 @@ class AudioEngine:
         with self.lock:
             self.phase = 0.0
             self.sweep_time = 0.0
+            self.track_pos = 0
             self.playing = True
             if self.mode == "random_hop":
                 self._new_hop(0.0)
@@ -182,7 +229,7 @@ class AudioEngine:
             self.stream.stop()
             self.stream.close()
         
-        # 使用动态的 self.sample_rate 和 self.blocksize
+        # Use dynamic self.sample_rate and self.blocksize
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate, 
             channels=1, 
@@ -202,6 +249,8 @@ class AudioEngine:
 
     def current_freq(self) -> float:
         with self.lock:
+            if self.mode == "track":
+                return 0.0
             if self.mode == "tone":
                 return self.frequency
             if self.mode == "random_hop":
@@ -229,10 +278,19 @@ class App:
         self.root.title("MiTtRAYNR - Waveform Generator")
         self.root.resizable(False, False)
         self.engine = AudioEngine()
+        self.track_error = None
+        self._load_demo_track()
         self._build_ui()
         self._update_display()
         self._update_scope()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _load_demo_track(self):
+        path = resource_path(os.path.join("assets", "demo-audio.opus"))
+        try:
+            self.engine.load_track(path, "Demo Track")
+        except Exception as exc:
+            self.track_error = str(exc)
 
     def _build_ui(self):
         p = dict(padx=10, pady=6)
@@ -241,17 +299,30 @@ class App:
         frm_wave = ttk.LabelFrame(self.root, text=" Waveform (select 1-4) ")
         frm_wave.grid(row=0, column=0, sticky="nsew", **p)
         self.wave_vars: dict = {}
+        self.wave_cbs: list = []
         self._last_wave = "sine"
         for i, name in enumerate(["sine", "square", "triangle", "sawtooth"]):
             var = tk.BooleanVar(value=(name == "sine"))
             self.wave_vars[name] = var
-            ttk.Checkbutton(frm_wave, text=name.capitalize(), variable=var,
-                            command=self._on_wave_change).grid(row=i, column=0, sticky="w", padx=10, pady=2)
+            cb = ttk.Checkbutton(frm_wave, text=name.capitalize(), variable=var,
+                                 command=self._on_wave_change)
+            cb.grid(row=i, column=0, sticky="w", padx=10, pady=2)
+            self.wave_cbs.append(cb)
+
+        # ---------- Demo Track (bundled audio) ----------
+        ttk.Separator(frm_wave, orient="horizontal").grid(
+            row=4, column=0, sticky="ew", padx=6, pady=4)
+        self.track_var = tk.BooleanVar(value=False)
+        self.track_cb = ttk.Checkbutton(frm_wave, text="Demo Track",
+                                        variable=self.track_var,
+                                        command=self._on_track_change)
+        self.track_cb.grid(row=5, column=0, sticky="w", padx=10, pady=2)
 
         # ---------- Mode Selection ----------
         frm_mode = ttk.LabelFrame(self.root, text=" Mode ")
         frm_mode.grid(row=0, column=1, sticky="nsew", **p)
         self.mode_var = tk.StringVar(value="tone")
+        self.mode_rbs: list = []
         self.tone_widgets: list = []
         self.sweep_widgets: list = []
         self.hop_widgets: list = []
@@ -261,8 +332,10 @@ class App:
             ("Repeated Sweep", "sweep_repeat"),
             ("Random Frequency Hop", "random_hop")
         ]):
-            ttk.Radiobutton(frm_mode, text=label, variable=self.mode_var,
-                            value=val, command=self._on_mode_change).grid(row=i, column=0, sticky="w", padx=10, pady=2)
+            rb = ttk.Radiobutton(frm_mode, text=label, variable=self.mode_var,
+                                 value=val, command=self._on_mode_change)
+            rb.grid(row=i, column=0, sticky="w", padx=10, pady=2)
+            self.mode_rbs.append(rb)
 
         # ---------- Tone Frequency ----------
         frm_tone = ttk.LabelFrame(self.root, text=" Tone Frequency ")
@@ -439,6 +512,7 @@ class App:
             frm_info,
             text="Err... so this is a waveform generator. \n"
                  "You can generate sine, square, triangle, and sawtooth waves, as well as frequency sweeps. \n"
+                 "Tick \"Demo Track\" to loop the bundled audio track (only the volume control stays active). \n"
                  "Adjust the parameters above and click Start to play the sound. \n"
                  "MiTtRAYNR = Maybe it's Time to Retaliate Against Your Noisy Roommate.",
             foreground="gray", justify="left"
@@ -479,17 +553,20 @@ class App:
         if self.engine.playing:
             data = self.engine.get_scope_data()
             self._draw_scope_wave(data)
-            try:
-                cycles = int(self.scope_cycles_var.get())
-            except ValueError:
-                cycles = 24
-            freq = self.engine.current_freq()
-            time_per_div = (cycles / freq) / 10 if freq > 0 else 0
-            if time_per_div >= 1e-3:
-                t_str = f"{time_per_div * 1000:.2f} ms/div"
+            if self.engine.mode == "track":
+                self.scope_info_var.set("CH1  1.0V/div  |  Demo Track")
             else:
-                t_str = f"{time_per_div * 1e6:.1f} µs/div"
-            self.scope_info_var.set(f"CH1  1.0V/div  |  {t_str}  |  {freq:.1f} Hz")
+                try:
+                    cycles = int(self.scope_cycles_var.get())
+                except ValueError:
+                    cycles = 24
+                freq = self.engine.current_freq()
+                time_per_div = (cycles / freq) / 10 if freq > 0 else 0
+                if time_per_div >= 1e-3:
+                    t_str = f"{time_per_div * 1000:.2f} ms/div"
+                else:
+                    t_str = f"{time_per_div * 1e6:.1f} µs/div"
+                self.scope_info_var.set(f"CH1  1.0V/div  |  {t_str}  |  {freq:.1f} Hz")
         else:
             h = self.SCOPE_H
             y = h // 2
@@ -638,27 +715,43 @@ class App:
             self._last_wave = selected[-1]
         self._sync()
 
+    def _on_track_change(self):
+        if self.track_var.get() and self.track_error is not None:
+            messagebox.showerror("Demo Track Error",
+                                 f"Failed to load the demo track!\n\n{self.track_error}")
+            self.track_var.set(False)
+        self._on_mode_change()
+
     def _on_vol(self, val):
         self.vol_var.set(f"{val} %")
         self._sync()
 
     def _on_mode_change(self):
+        track = self.track_var.get()
         mode = self.mode_var.get()
-        is_tone = mode == "tone"
-        is_sweep = mode in ("sweep_once", "sweep_repeat")
-        is_hop = mode == "random_hop"
+        is_tone = (not track) and mode == "tone"
+        is_sweep = (not track) and mode in ("sweep_once", "sweep_repeat")
+        is_hop = (not track) and mode == "random_hop"
         for w in self.tone_widgets:
             w.config(state="normal" if is_tone else "disabled")
         for w in self.sweep_widgets:
             w.config(state="normal" if is_sweep else "disabled")
         for w in self.hop_widgets:
             w.config(state="normal" if is_hop else "disabled")
+        # While the demo track is selected, only the volume control stays active.
+        for cb in self.wave_cbs:
+            cb.config(state="disabled" if track else "normal")
+        for rb in self.mode_rbs:
+            rb.config(state="disabled" if track else "normal")
+        self.sr_combo.config(state="disabled" if track else "readonly")
+        self.bs_combo.config(state="disabled" if track else "readonly")
         self._sync()
 
     def _sync(self):
         e = self.engine
         e.waveforms = [n for n, v in self.wave_vars.items() if v.get()] or ["sine"]
-        e.mode = self.mode_var.get()
+        track = self.track_var.get()
+        e.mode = "track" if track else self.mode_var.get()
         e.frequency = slider_to_freq(self.tone_slider.get())
         e.sweep_start = slider_to_freq(self.sw_start_sl.get())
         e.sweep_end = slider_to_freq(self.sw_end_sl.get())
@@ -670,14 +763,20 @@ class App:
         e.volume = self.vol_slider.get() / 100.0
 
         need_restart = False
-        try:
-            new_sr = int(self.sr_var.get())
-            if new_sr != e.sample_rate:
-                e.sample_rate = new_sr
+        if track and e.track_samplerate:
+            # Play the track at its native sample rate to avoid pitch shift.
+            if e.track_samplerate != e.sample_rate:
+                e.sample_rate = e.track_samplerate
                 need_restart = True
-        except ValueError:
-            pass
-            
+        else:
+            try:
+                new_sr = int(self.sr_var.get())
+                if new_sr != e.sample_rate:
+                    e.sample_rate = new_sr
+                    need_restart = True
+            except ValueError:
+                pass
+
         try:
             new_bs = int(self.bs_var.get())
             if new_bs != e.blocksize:
@@ -708,8 +807,11 @@ class App:
 
     def _update_display(self):
         if self.engine.playing:
-            f = self.engine.current_freq()
-            self.freq_lbl.config(text=f"Current Frequency: {f:.1f} Hz")
+            if self.engine.mode == "track":
+                self.freq_lbl.config(text=f"Now Playing: {self.engine.track_name}")
+            else:
+                f = self.engine.current_freq()
+                self.freq_lbl.config(text=f"Current Frequency: {f:.1f} Hz")
         else:
             if "Playing" in self.status_var.get():
                 self.status_var.set("⏹ Stopped")
