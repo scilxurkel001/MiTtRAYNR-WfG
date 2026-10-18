@@ -272,6 +272,10 @@ class AudioEngine:
 class App:
     SCOPE_W = 700
     SCOPE_H = 220
+    OSC_SPLIT_X = 412          # right edge of the oscilloscope (waveform) panel
+    FFT_BARS = 96              # number of spectrum bars in the FFT panel
+    FFT_DB_MIN = -80.0         # bottom of the FFT amplitude scale (dB)
+    FFT_DB_MAX = 0.0           # top of the FFT amplitude scale (dB)
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -473,6 +477,7 @@ class App:
                                       bg="#0a0f0a", highlightthickness=1,
                                       highlightbackground="#2a3a2a")
         self.scope_canvas.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        self.scope_canvas.bind("<Configure>", self._on_scope_resize)
 
         frm_scope_ctrl = ttk.Frame(frm_scope)
         frm_scope_ctrl.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
@@ -491,6 +496,7 @@ class App:
         self.scope_line = self.scope_canvas.create_line(
             [0] * (self.SCOPE_W * 2), fill="#39ff6e", width=1.6, smooth=False
         )
+        self._create_fft_bars()
 
         # ---------- Control ----------
         frm_ctrl = ttk.Frame(self.root)
@@ -527,24 +533,77 @@ class App:
 
         self._on_mode_change()
 
+    # ---------- Scope geometry ----------
+    def _scope_geometry(self):
+        """Return the canvas's current (w, h, split) in real pixels.
+
+        The canvas is stretched by the grid layout, so the drawn content must
+        follow its actual width instead of the initial request size; otherwise a
+        blank strip remains on the right-hand side.
+        """
+        w = self.scope_canvas.winfo_width()
+        if w <= 1:
+            w = self.SCOPE_W
+        h = self.scope_canvas.winfo_height()
+        if h <= 1:
+            h = self.SCOPE_H
+        split = min(self.OSC_SPLIT_X, max(1, w - 60))
+        return w, h, split
+
+    def _on_scope_resize(self, _event=None):
+        self._draw_scope_grid()
+
+    # ---------- Create FFT Bar Rectangles ----------
+    def _create_fft_bars(self):
+        """Pre-create the spectrum bar rectangles so per-frame updates are cheap.
+
+        Only the item ids are created here; positions are computed each frame
+        from the canvas's live geometry (see ``_draw_spectrum``).
+        """
+        self.fft_bars = []
+        for _ in range(self.FFT_BARS):
+            rid = self.scope_canvas.create_rectangle(
+                0, 0, 0, 0, fill="#39ff6e", outline=""
+            )
+            self.fft_bars.append(rid)
+
     # ---------- Paint Oscilloscope Grid ----------
     def _draw_scope_grid(self):
         c = self.scope_canvas
         c.delete("grid")
-        w, h = self.SCOPE_W, self.SCOPE_H
-        c.create_rectangle(0, 0, w, h, outline="#2a3a2a", tags="grid")
+        w, h, split = self._scope_geometry()
+
+        # --- Oscilloscope panel (left): time-domain grid ---
+        c.create_rectangle(0, 0, split, h, outline="#2a3a2a", tags="grid")
         for v in [-1.0, -0.5, 0.0, 0.5, 1.0]:
             y = int(h / 2 - v * (h / 2 - 4))
             color = "#3a5a3a" if v == 0 else "#1a2a1a"
-            width = 1 if v == 0 else 1
-            c.create_line(0, y, w, y, fill=color, width=width, tags="grid")
+            c.create_line(0, y, split, y, fill=color, width=1, tags="grid")
         for i in range(1, 10):
-            x = int(w * i / 10)
+            x = int(split * i / 10)
             c.create_line(x, 0, x, h, fill="#1a2a1a", width=1, tags="grid")
         c.create_text(6, h / 2 - (h / 2 - 4) - 2, text="+1.0", fill="#4a7a4a",
                       anchor="w", font=("Consolas", 8), tags="grid")
         c.create_text(6, h / 2 + (h / 2 - 4) + 2, text="-1.0", fill="#4a7a4a",
                       anchor="w", font=("Consolas", 8), tags="grid")
+
+        # --- FFT panel (right): dB amplitude grid ---
+        c.create_rectangle(split, 0, w, h, outline="#2a3a2a", tags="grid")
+        span = self.FFT_DB_MAX - self.FFT_DB_MIN
+        for db in (-60, -40, -20, 0):
+            frac = (db - self.FFT_DB_MIN) / span
+            y = int(h - 4 - frac * (h - 8))
+            c.create_line(split, y, w, y, fill="#1a2a1a", width=1, tags="grid")
+            c.create_text(split + 3, y - 1, text=f"{db}", fill="#4a7a4a",
+                          anchor="sw", font=("Consolas", 7), tags="grid")
+        for i in range(1, 5):
+            x = int(split + (w - split) * i / 5)
+            c.create_line(x, 0, x, h, fill="#1a2a1a", width=1, tags="grid")
+        c.create_line(split, 0, split, h, fill="#3a5a3a", width=1, tags="grid")
+        c.create_text(split + 4, 3, text="FFT  (dB)", fill="#4a7a4a",
+                      anchor="nw", font=("Consolas", 8), tags="grid")
+        # Keep the grid behind the trace and spectrum bars.
+        c.tag_lower("grid")
 
     def _redraw_scope_grid(self):
         self._draw_scope_grid()
@@ -553,6 +612,7 @@ class App:
         if self.engine.playing:
             data = self.engine.get_scope_data()
             self._draw_scope_wave(data)
+            self._draw_spectrum(data)
             if self.engine.mode == "track":
                 self.scope_info_var.set("CH1  1.0V/div  |  Demo Track")
             else:
@@ -568,15 +628,84 @@ class App:
                     t_str = f"{time_per_div * 1e6:.1f} µs/div"
                 self.scope_info_var.set(f"CH1  1.0V/div  |  {t_str}  |  {freq:.1f} Hz")
         else:
-            h = self.SCOPE_H
+            _w, h, split = self._scope_geometry()
             y = h // 2
-            pts = [0, y, self.SCOPE_W, y]
+            pts = [0, y, split, y]
             self.scope_canvas.coords(self.scope_line, *pts)
+            self._clear_spectrum()
             self.scope_info_var.set("CH1  1.0V/div  |  —")
         self.root.after(16, self._update_scope)
 
+    def _draw_spectrum(self, data: np.ndarray):
+        """Compute an FFT of the most recent samples and update the bar graph."""
+        if data is None or len(data) < 16:
+            self._clear_spectrum()
+            return
+        n = len(data)
+        # Remove DC offset so a constant bias doesn't dominate the spectrum.
+        seg = data - float(np.mean(data))
+        # Hanning window reduces spectral leakage between bins.
+        window = np.hanning(n)
+        spectrum = np.abs(np.fft.rfft(seg * window))
+        if not np.any(spectrum):
+            self._clear_spectrum()
+            return
+        # Normalise so the strongest component sits near the top of the scale.
+        spectrum /= (np.max(spectrum) + 1e-12)
+        db = 20.0 * np.log10(spectrum + 1e-12)
+
+        # Only show the audible band (approx. 20 Hz to 18 kHz, clipped by Nyquist).
+        freqs = np.fft.rfftfreq(n, d=1.0 / self.engine.sample_rate)
+        nyquist = self.engine.sample_rate / 2.0
+        f_hi = min(18000.0, nyquist)
+        lo_bin = int(np.searchsorted(freqs, 20.0))
+        hi_bin = int(np.searchsorted(freqs, f_hi))
+
+        n_bars = self.FFT_BARS
+        w, h, split = self._scope_geometry()
+        x0, x1 = split, w
+        top = 4
+        bottom = h - 4
+        span = self.FFT_DB_MAX - self.FFT_DB_MIN
+        usable = (x1 - x0) - 4
+        bar_w = usable / n_bars
+
+        # Logarithmically spaced bin edges so low frequencies get more detail.
+        if hi_bin <= lo_bin or bar_w <= 0:
+            self._clear_spectrum()
+            return
+        edges = np.unique(np.geomspace(
+            max(lo_bin, 1), hi_bin, num=n_bars + 1
+        ).astype(int))
+        # If the band collapses to fewer bars than we draw, pad the edges.
+        if len(edges) < 2:
+            self._clear_spectrum()
+            return
+
+        for i, rid in enumerate(self.fft_bars):
+            bx0 = x0 + 2 + i * bar_w + 0.5
+            bx1 = bx0 + bar_w - 1.0
+            frac = i / n_bars
+            start = edges[min(int(frac * (len(edges) - 1)), len(edges) - 2)]
+            end = edges[min(int((i + 1) / n_bars * (len(edges) - 1)), len(edges) - 1)]
+            if end <= start:
+                peak_db = db[start] if start < len(db) else self.FFT_DB_MIN
+            else:
+                peak_db = float(np.max(db[start:end]))
+            level = (peak_db - self.FFT_DB_MIN) / span
+            level = min(1.0, max(0.0, level))
+            y_top = bottom - level * (bottom - top)
+            self.scope_canvas.coords(rid, bx0, y_top, bx1, bottom)
+
+    def _clear_spectrum(self):
+        _w, h, _split = self._scope_geometry()
+        bottom = h - 4
+        for rid in self.fft_bars:
+            self.scope_canvas.coords(rid, 0, bottom, 0, bottom)
+
     def _draw_scope_wave(self, data: np.ndarray):
-        w, h = self.SCOPE_W, self.SCOPE_H
+        _w, h, split = self._scope_geometry()
+        w = split
         try:
             cycles = int(self.scope_cycles_var.get())
         except ValueError:
