@@ -1,9 +1,8 @@
 import os
-import sys
 import platform
 import ctypes
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import numpy as np
 import math
 import threading
@@ -11,10 +10,15 @@ import sounddevice as sd
 import soundfile as sf
 
 
-def resource_path(rel_path: str) -> str:
-    """Resolve a bundled resource path for both source runs and PyInstaller."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel_path)
+# Audio file formats the player accepts (MP3 / OPUS / FLAC).
+AUDIO_FILE_TYPES = [
+    ("Audio files", "*.mp3 *.opus *.flac"),
+    ("MP3", "*.mp3"),
+    ("OPUS", "*.opus"),
+    ("FLAC", "*.flac"),
+    ("All files", "*.*"),
+]
+AUDIO_FILE_EXTS = (".mp3", ".opus", ".flac")
 
 # ============== Conversion between slider value and frequency ==============
 def slider_to_freq(val: float) -> float:
@@ -82,24 +86,42 @@ class AudioEngine:
         self.scope_lock = threading.Lock()
         self.scope_write_pos = 0
 
-        # Audio track playback (e.g. the bundled demo track)
+        # Audio file playback (MP3 / OPUS / FLAC)
         self.track_data = None          # mono float32 samples
         self.track_pos = 0              # playback cursor (samples)
         self.track_name = ""
         self.track_samplerate = 0       # native sample rate of the track
+        self.track_loop = True          # loop the track continuously
+        self.track_samples = 0          # samples played in the current pass
+        self.track_finished = False     # set once a non-looping track ends
 
     def load_track(self, path: str, name: str = "") -> None:
-        """Decode an audio file into a mono float32 buffer for playback."""
+        """Decode an audio file (MP3/OPUS/FLAC) into a mono float32 buffer."""
         data, sr = sf.read(path, dtype="float32", always_2d=True)
         if data.shape[1] > 1:
             data = data.mean(axis=1)
         else:
             data = data[:, 0]
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        if data.size == 0:
+            raise ValueError("The selected audio file contains no samples.")
         with self.lock:
-            self.track_data = np.ascontiguousarray(data, dtype=np.float32)
+            self.track_data = data
             self.track_name = name or os.path.basename(path)
             self.track_samplerate = int(sr)
             self.track_pos = 0
+            self.track_samples = 0
+            self.track_finished = False
+
+    def load_track_from_file(self, path: str) -> None:
+        """Load a user-selected audio file and adopt its native sample rate."""
+        self.load_track(path, os.path.basename(path))
+        with self.lock:
+            # Play back at the file's native rate to avoid pitch shifting.
+            self.sample_rate = self.track_samplerate
+            self.track_pos = 0
+            self.track_samples = 0
+            self.track_finished = False
 
     def _freq_at(self, t: float) -> float:
         progress = t / self.sweep_duration
@@ -161,20 +183,40 @@ class AudioEngine:
                 outdata[:] = 0
                 return
             if self.mode == "track":
-                # Loop the decoded audio track continuously.
+                # Play the decoded audio file, looping it when enabled.
                 if self.track_data is None or len(self.track_data) == 0:
                     outdata[:] = 0
                     return
                 n = len(self.track_data)
                 pos = self.track_pos
-                if pos + frames <= n:
-                    chunk = self.track_data[pos:pos + frames]
+                if self.track_loop:
+                    if pos + frames <= n:
+                        chunk = self.track_data[pos:pos + frames]
+                    else:
+                        first = n - pos
+                        chunk = np.concatenate(
+                            [self.track_data[pos:], self.track_data[:frames - first]]
+                        )
+                    self.track_pos = (pos + frames) % n
                 else:
-                    first = n - pos
-                    chunk = np.concatenate(
-                        [self.track_data[pos:], self.track_data[:frames - first]]
-                    )
-                self.track_pos = (pos + frames) % n
+                    remaining = n - pos
+                    if remaining <= 0:
+                        # Track finished: emit silence and stop playback.
+                        outdata[:] = 0
+                        self.playing = False
+                        self.track_finished = True
+                        return
+                    if frames <= remaining:
+                        chunk = self.track_data[pos:pos + frames]
+                        self.track_pos = pos + frames
+                        if self.track_pos >= n:
+                            self.track_finished = True
+                    else:
+                        chunk = np.zeros(frames, dtype=np.float32)
+                        chunk[:remaining] = self.track_data[pos:]
+                        self.track_pos = n
+                        self.track_finished = True
+                self.track_samples += len(chunk)
                 wave = chunk * self.volume
                 self._write_scope(wave.astype(np.float32))
                 outdata[:] = wave.reshape(-1, 1)
@@ -222,6 +264,8 @@ class AudioEngine:
             self.phase = 0.0
             self.sweep_time = 0.0
             self.track_pos = 0
+            self.track_samples = 0
+            self.track_finished = False
             self.playing = True
             if self.mode == "random_hop":
                 self._new_hop(0.0)
@@ -268,6 +312,18 @@ class AudioEngine:
             buf = self.scope_buffer
             return np.concatenate([buf[pos:], buf[:pos]]).astype(np.float32)
 
+    def track_progress(self):
+        """Return (elapsed_seconds, total_seconds) for the loaded track."""
+        with self.lock:
+            if self.track_data is None or self.track_samplerate <= 0:
+                return 0.0, 0.0
+            total = len(self.track_data) / self.track_samplerate
+            if self.track_loop:
+                pos = self.track_samples % len(self.track_data)
+            else:
+                pos = min(self.track_samples, len(self.track_data))
+            return pos / self.track_samplerate, total
+
 # ========================= GUI Application =========================
 class App:
     SCOPE_W = 700
@@ -284,6 +340,8 @@ class App:
         self.root.title("MiTtRAYNR - Waveform Generator")
         self.root.resizable(False, False)
         self.engine = AudioEngine()
+        # Audio player state (populated by the Audio File Player panel).
+        self.track_path = None
         self.track_error = None
         # Spectrogram state (populated by _create_spectrogram).
         self.spec_photo = None
@@ -297,18 +355,68 @@ class App:
         self._spec_every = max(1, int(round((1000.0 / self.FFT_FPS) / 16.0)))
         self._spec_counter = 0
         self._spec_was_active = False
-        self._load_demo_track()
         self._build_ui()
         self._update_display()
         self._update_scope()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _load_demo_track(self):
-        path = resource_path(os.path.join("assets", "demo-audio.opus"))
+    def _on_load_file(self):
+        """Prompt the user to choose an MP3/OPUS/FLAC file and load it."""
+        path = filedialog.askopenfilename(
+            title="Open Audio File",
+            filetypes=AUDIO_FILE_TYPES,
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in AUDIO_FILE_EXTS:
+            messagebox.showerror(
+                "Unsupported Format",
+                "Please choose an MP3, OPUS, or FLAC file.",
+            )
+            return
         try:
-            self.engine.load_track(path, "Demo Track")
+            self.engine.load_track_from_file(path)
         except Exception as exc:
             self.track_error = str(exc)
+            messagebox.showerror(
+                "Audio File Error",
+                f"Failed to load the audio file!\n\n{exc}",
+            )
+            return
+        self.track_error = None
+        self.track_path = path
+        self.track_name_var.set(os.path.basename(path))
+        self.track_var.set(True)
+        self.sr_var.set(str(self.engine.track_samplerate))
+        self._on_mode_change()
+        if self.engine.playing:
+            self._start()
+
+    def _on_clear_track(self):
+        """Unload the current audio file."""
+        self.engine.stop()
+        with self.engine.lock:
+            self.engine.track_data = None
+            self.engine.track_name = ""
+            self.engine.track_samplerate = 0
+        self.track_path = None
+        self.track_name_var.set("(no file loaded)")
+        self.track_var.set(False)
+        self._on_mode_change()
+        self.status_var.set("⏹ Stopped")
+
+    def _on_track_toggle(self, *_):
+        """Called when the Play Audio File checkbox is toggled."""
+        if self.track_var.get() and self.engine.track_data is None:
+            # Nothing loaded yet: guide the user to pick a file.
+            self.track_var.set(False)
+            messagebox.showinfo(
+                "No Audio File",
+                "No audio file is loaded.\nClick \"Open File…\" to choose one.",
+            )
+            return
+        self._on_mode_change()
 
     def _build_ui(self):
         p = dict(padx=10, pady=6)
@@ -327,14 +435,35 @@ class App:
             cb.grid(row=i, column=0, sticky="w", padx=10, pady=2)
             self.wave_cbs.append(cb)
 
-        # ---------- Demo Track (bundled audio) ----------
-        ttk.Separator(frm_wave, orient="horizontal").grid(
-            row=4, column=0, sticky="ew", padx=6, pady=4)
+        # ---------- Audio File Player ----------
+        frm_player = ttk.LabelFrame(self.root, text=" Audio File Player (MP3 / OPUS / FLAC) ")
+        frm_player.grid(row=6, column=0, columnspan=2, sticky="ew", **p)
+        frm_player.columnconfigure(1, weight=1)
         self.track_var = tk.BooleanVar(value=False)
-        self.track_cb = ttk.Checkbutton(frm_wave, text="Demo Track",
+        self.track_cb = ttk.Checkbutton(frm_player, text="Play Audio File",
                                         variable=self.track_var,
-                                        command=self._on_track_change)
-        self.track_cb.grid(row=5, column=0, sticky="w", padx=10, pady=2)
+                                        command=self._on_track_toggle)
+        self.track_cb.grid(row=0, column=0, sticky="w", padx=10, pady=3)
+        self.loop_var = tk.BooleanVar(value=True)
+        self.loop_cb = ttk.Checkbutton(frm_player, text="Loop ∞",
+                                       variable=self.loop_var,
+                                       command=self._on_loop_change)
+        self.loop_cb.grid(row=0, column=1, sticky="w", padx=10, pady=3)
+        self.btn_open = ttk.Button(frm_player, text="Open File…",
+                                   command=self._on_load_file)
+        self.btn_open.grid(row=0, column=2, padx=4, pady=3)
+        self.btn_clear = ttk.Button(frm_player, text="Clear",
+                                    command=self._on_clear_track)
+        self.btn_clear.grid(row=0, column=3, padx=4, pady=3)
+        self.track_name_var = tk.StringVar(value="(no file loaded)")
+        self.track_name_lbl = ttk.Label(frm_player, textvariable=self.track_name_var,
+                                        foreground="gray")
+        self.track_name_lbl.grid(row=1, column=0, columnspan=2, sticky="w",
+                                 padx=10, pady=(0, 4))
+        self.track_time_var = tk.StringVar(value="0:00 / 0:00")
+        ttk.Label(frm_player, textvariable=self.track_time_var,
+                  font=("Consolas", 9)).grid(row=1, column=3, sticky="e",
+                                             padx=6, pady=(0, 4))
 
         # ---------- Mode Selection ----------
         frm_mode = ttk.LabelFrame(self.root, text=" Mode ")
@@ -485,7 +614,7 @@ class App:
 
         # ============== Oscilloscope ==============
         frm_scope = ttk.LabelFrame(self.root, text=" Oscilloscope ")
-        frm_scope.grid(row=6, column=0, columnspan=2, sticky="nsew", **p)
+        frm_scope.grid(row=7, column=0, columnspan=2, sticky="nsew", **p)
         frm_scope.columnconfigure(0, weight=1)
         self.scope_canvas = tk.Canvas(frm_scope, width=self.SCOPE_W, height=self.SCOPE_H,
                                       bg="#0a0f0a", highlightthickness=1,
@@ -514,7 +643,7 @@ class App:
 
         # ---------- Control ----------
         frm_ctrl = ttk.Frame(self.root)
-        frm_ctrl.grid(row=7, column=0, columnspan=2, sticky="ew", **p) 
+        frm_ctrl.grid(row=8, column=0, columnspan=2, sticky="ew", **p) 
         self.freq_lbl = ttk.Label(frm_ctrl, text="Current Frequency: 440.0 Hz",
                                   font=("TkDefaultFont", 13, "bold"))
         self.freq_lbl.pack(side="left", padx=8)
@@ -527,12 +656,12 @@ class App:
 
         # ---------- Note ----------
         frm_info = ttk.Frame(self.root)
-        frm_info.grid(row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
+        frm_info.grid(row=9, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
         ttk.Label(
             frm_info,
             text="Err... so this is a waveform generator. \n"
                  "You can generate sine, square, triangle, and sawtooth waves, as well as frequency sweeps. \n"
-                 "Tick \"Demo Track\" to loop the bundled audio track (only the volume control stays active). \n"
+                 "Use the Audio File Player to play MP3 / OPUS / FLAC files with infinite looping. \n"
                  "Adjust the parameters above and click Start to play the sound. \n"
                  "MiTtRAYNR = Maybe it's Time to Retaliate Against Your Noisy Roommate.",
             foreground="gray", justify="left"
@@ -748,7 +877,7 @@ class App:
                 self._spec_counter = 0
                 self._feed_spectrogram(data)
             if self.engine.mode == "track":
-                self.scope_info_var.set("CH1  1.0V/div  |  Demo Track")
+                self.scope_info_var.set("CH1  1.0V/div  |  Audio File")
             else:
                 try:
                     cycles = int(self.scope_cycles_var.get())
@@ -913,12 +1042,8 @@ class App:
             self._last_wave = selected[-1]
         self._sync()
 
-    def _on_track_change(self):
-        if self.track_var.get() and self.track_error is not None:
-            messagebox.showerror("Demo Track Error",
-                                 f"Failed to load the demo track!\n\n{self.track_error}")
-            self.track_var.set(False)
-        self._on_mode_change()
+    def _on_loop_change(self):
+        self.engine.track_loop = self.loop_var.get()
 
     def _on_vol(self, val):
         self.vol_var.set(f"{val} %")
@@ -936,7 +1061,7 @@ class App:
             w.config(state="normal" if is_sweep else "disabled")
         for w in self.hop_widgets:
             w.config(state="normal" if is_hop else "disabled")
-        # While the demo track is selected, only the volume control stays active.
+        # While the audio file is playing, only the volume control stays active.
         for cb in self.wave_cbs:
             cb.config(state="disabled" if track else "normal")
         for rb in self.mode_rbs:
@@ -959,6 +1084,7 @@ class App:
         e.hop_end = slider_to_freq(self.hop_max_sl.get())
         e.hop_interval = max(0.1, self.hop_int_sl.get() / 1000.0)
         e.volume = self.vol_slider.get() / 100.0
+        e.track_loop = self.loop_var.get()
 
         need_restart = False
         if track and e.track_samplerate:
@@ -1003,6 +1129,11 @@ class App:
         self.engine.stop()
         self.status_var.set("⏹ Stopped")
 
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
     def _update_display(self):
         if self.engine.playing:
             if self.engine.mode == "track":
@@ -1014,6 +1145,15 @@ class App:
             if "Playing" in self.status_var.get():
                 self.status_var.set("⏹ Stopped")
             self.freq_lbl.config(text="Current Frequency: —")
+
+        # Refresh the player time read-out.
+        if self.engine.track_data is not None and self.engine.track_samplerate > 0:
+            elapsed, total = self.engine.track_progress()
+            self.track_time_var.set(
+                f"{self._fmt_time(elapsed)} / {self._fmt_time(total)}"
+            )
+        else:
+            self.track_time_var.set("0:00 / 0:00")
         self.root.after(16, self._update_display)
 
     def _on_close(self):
