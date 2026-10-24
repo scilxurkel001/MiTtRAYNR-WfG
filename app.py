@@ -1,4 +1,5 @@
 import os
+import sys
 import platform
 import ctypes
 import tkinter as tk
@@ -19,6 +20,24 @@ AUDIO_FILE_TYPES = [
     ("All files", "*.*"),
 ]
 AUDIO_FILE_EXTS = (".mp3", ".opus", ".flac")
+
+# Bundled demo track. It plays whenever the user has not selected another
+# audio file. The file name below must match the file in the assets folder
+# exactly (including the double dot before the extension).
+ASSETS_DIRNAME = "assets"
+DEMO_AUDIO_NAME = "37 Tonight Stars an Easygoing Egoist (Live ver.) ~ Egoistic Flowers..opus"
+
+
+def resource_path(*parts: str) -> str:
+    """Return an absolute path to a bundled resource.
+
+    When frozen by PyInstaller the data lives under ``sys._MEIPASS``; when
+    running from source it sits next to this script.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base is None:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *parts)
 
 # ============== Conversion between slider value and frequency ==============
 def slider_to_freq(val: float) -> float:
@@ -87,28 +106,39 @@ class AudioEngine:
         self.scope_write_pos = 0
 
         # Audio file playback (MP3 / OPUS / FLAC)
-        self.track_data = None          # mono float32 samples
+        self.track_data = None          # float32 samples: (n,) mono or (n, 2) stereo
         self.track_pos = 0              # playback cursor (samples)
         self.track_name = ""
         self.track_samplerate = 0       # native sample rate of the track
+        self.track_channels = 0         # native channel count (1 = mono, 2 = stereo)
         self.track_loop = True          # loop the track continuously
         self.track_samples = 0          # samples played in the current pass
         self.track_finished = False     # set once a non-looping track ends
+        self.channels = 1               # channel count of the active output stream
 
     def load_track(self, path: str, name: str = "") -> None:
-        """Decode an audio file (MP3/OPUS/FLAC) into a mono float32 buffer."""
+        """Decode an audio file (MP3/OPUS/FLAC) preserving native stereo.
+
+        Stereo files are kept as two channels so playback never downmixes.
+        Downmixing to mono would sum the channels and cancel out-of-phase
+        content (phase cancellation), so we retain the native channel layout.
+        """
         data, sr = sf.read(path, dtype="float32", always_2d=True)
-        if data.shape[1] > 1:
-            data = data.mean(axis=1)
+        if data.shape[1] >= 2:
+            # Keep native stereo (first two channels) instead of downmixing.
+            data = data[:, :2]
+            channels = 2
         else:
             data = data[:, 0]
+            channels = 1
         data = np.ascontiguousarray(data, dtype=np.float32)
-        if data.size == 0:
+        if data.shape[0] == 0:
             raise ValueError("The selected audio file contains no samples.")
         with self.lock:
             self.track_data = data
             self.track_name = name or os.path.basename(path)
             self.track_samplerate = int(sr)
+            self.track_channels = channels
             self.track_pos = 0
             self.track_samples = 0
             self.track_finished = False
@@ -122,6 +152,21 @@ class AudioEngine:
             self.track_pos = 0
             self.track_samples = 0
             self.track_finished = False
+
+    def load_demo_track(self) -> bool:
+        """Load the bundled demo track.
+
+        The demo file ships in the ``assets`` folder and its name must not be
+        changed. Returns True when the demo track was loaded successfully.
+        """
+        path = resource_path(ASSETS_DIRNAME, DEMO_AUDIO_NAME)
+        if not os.path.isfile(path):
+            return False
+        try:
+            self.load_track_from_file(path)
+        except Exception:
+            return False
+        return True
 
     def _freq_at(self, t: float) -> float:
         progress = t / self.sweep_duration
@@ -212,14 +257,18 @@ class AudioEngine:
                         if self.track_pos >= n:
                             self.track_finished = True
                     else:
-                        chunk = np.zeros(frames, dtype=np.float32)
+                        # Pad the tail with silence, matching the channel layout.
+                        chunk = np.zeros((frames,) + self.track_data.shape[1:],
+                                         dtype=np.float32)
                         chunk[:remaining] = self.track_data[pos:]
                         self.track_pos = n
                         self.track_finished = True
                 self.track_samples += len(chunk)
                 wave = chunk * self.volume
-                self._write_scope(wave.astype(np.float32))
-                outdata[:] = wave.reshape(-1, 1)
+                # The scope shows a mono view; playback keeps native channels.
+                scope = wave.mean(axis=1) if wave.ndim > 1 else wave
+                self._write_scope(scope.astype(np.float32))
+                outdata[:] = wave if wave.ndim > 1 else wave.reshape(-1, 1)
                 return
             dt = np.arange(frames, dtype=np.float64) / self.sample_rate
             t = dt + self.sweep_time
@@ -273,10 +322,13 @@ class AudioEngine:
             self.stream.stop()
             self.stream.close()
         
-        # Use dynamic self.sample_rate and self.blocksize
+        # Use dynamic self.sample_rate and self.blocksize. Play tracks with
+        # their native channel count so stereo is never downmixed to mono.
+        channels = self.track_channels if (self.mode == "track" and self.track_channels > 0) else 1
+        self.channels = channels
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate, 
-            channels=1, 
+            channels=channels, 
             dtype="float32",
             callback=self._callback, 
             blocksize=self.blocksize,
@@ -343,6 +395,7 @@ class App:
         # Audio player state (populated by the Audio File Player panel).
         self.track_path = None
         self.track_error = None
+        self.track_is_demo = False     # True while the bundled demo track is loaded
         # Spectrogram state (populated by _create_spectrogram).
         self.spec_photo = None
         self.spec_item = None
@@ -386,9 +439,40 @@ class App:
             return
         self.track_error = None
         self.track_path = path
+        self.track_is_demo = False
         self.track_name_var.set(os.path.basename(path))
         self.track_var.set(True)
         self.sr_var.set(str(self.engine.track_samplerate))
+        self._on_mode_change()
+        if self.engine.playing:
+            self._start()
+
+    def _load_demo_track(self) -> bool:
+        """Load the bundled demo track.
+
+        The demo lives in the assets folder and its file name must be kept
+        unchanged. Returns True when it was loaded successfully.
+        """
+        if not self.engine.load_demo_track():
+            self.track_is_demo = False
+            self.track_path = None
+            return False
+        self.track_is_demo = True
+        self.track_path = None
+        self.track_name_var.set(DEMO_AUDIO_NAME)
+        self.sr_var.set(str(self.engine.track_samplerate))
+        return True
+
+    def _on_load_demo(self):
+        """Load and play the bundled demo track."""
+        if not self._load_demo_track():
+            messagebox.showerror(
+                "Demo File Missing",
+                "The bundled demo audio file could not be found or decoded.\n\n"
+                f"Expected: {os.path.join(ASSETS_DIRNAME, DEMO_AUDIO_NAME)}",
+            )
+            return
+        self.track_var.set(True)
         self._on_mode_change()
         if self.engine.playing:
             self._start()
@@ -400,7 +484,9 @@ class App:
             self.engine.track_data = None
             self.engine.track_name = ""
             self.engine.track_samplerate = 0
+            self.engine.track_channels = 0
         self.track_path = None
+        self.track_is_demo = False
         self.track_name_var.set("(no file loaded)")
         self.track_var.set(False)
         self._on_mode_change()
@@ -409,11 +495,13 @@ class App:
     def _on_track_toggle(self, *_):
         """Called when the Play Audio File checkbox is toggled."""
         if self.track_var.get() and self.engine.track_data is None:
-            # Nothing loaded yet: guide the user to pick a file.
+            # Nothing loaded yet: guide the user to pick a file or the demo.
             self.track_var.set(False)
             messagebox.showinfo(
                 "No Audio File",
-                "No audio file is loaded.\nClick \"Open File…\" to choose one.",
+                "No audio file is loaded.\n"
+                "Click \"Open File…\" to choose one, or \"Demo File\" to "
+                "load the bundled demo track.",
             )
             return
         self._on_mode_change()
@@ -452,9 +540,12 @@ class App:
         self.btn_open = ttk.Button(frm_player, text="Open File…",
                                    command=self._on_load_file)
         self.btn_open.grid(row=0, column=2, padx=4, pady=3)
+        self.btn_demo = ttk.Button(frm_player, text="Demo File",
+                                   command=self._on_load_demo)
+        self.btn_demo.grid(row=0, column=3, padx=4, pady=3)
         self.btn_clear = ttk.Button(frm_player, text="Clear",
                                     command=self._on_clear_track)
-        self.btn_clear.grid(row=0, column=3, padx=4, pady=3)
+        self.btn_clear.grid(row=0, column=4, padx=4, pady=3)
         self.track_name_var = tk.StringVar(value="(no file loaded)")
         self.track_name_lbl = ttk.Label(frm_player, textvariable=self.track_name_var,
                                         foreground="gray")
@@ -462,7 +553,7 @@ class App:
                                  padx=10, pady=(0, 4))
         self.track_time_var = tk.StringVar(value="0:00 / 0:00")
         ttk.Label(frm_player, textvariable=self.track_time_var,
-                  font=("Consolas", 9)).grid(row=1, column=3, sticky="e",
+                  font=("Consolas", 9)).grid(row=1, column=4, sticky="e",
                                              padx=6, pady=(0, 4))
 
         # ---------- Mode Selection ----------
@@ -1108,7 +1199,13 @@ class App:
                 need_restart = True
         except ValueError:
             pass
-            
+
+        # Switching between mono tone generation and a stereo track (or vice
+        # versa) changes the output channel count, so the stream must restart.
+        desired_channels = e.track_channels if (track and e.track_channels > 0) else 1
+        if desired_channels != e.channels:
+            need_restart = True
+
         # If the engine is currently playing, restart it to apply new settings
         if need_restart and e.playing:
             self._start()
